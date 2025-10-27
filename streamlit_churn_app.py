@@ -68,6 +68,10 @@ if 'production_model' not in st.session_state:
     st.session_state.production_model = None
 if 'feature_schema' not in st.session_state:
     st.session_state.feature_schema = None
+if 'raw_bytes' not in st.session_state:
+    st.session_state.raw_bytes = None
+if 'raw_name' not in st.session_state:
+    st.session_state.raw_name = None
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -235,38 +239,40 @@ page = st.sidebar.selectbox(
 # ==================== PAGE 1: UPLOAD DATA ====================
 if page == "📤 Upload Data":
     st.header("📤 Upload Your Dataset")
-    
+
     uploaded_file = st.file_uploader(
         "Upload CSV file with customer data",
         type=['csv'],
-        help="Your dataset should include customer features and a churn column"
+        help="Your dataset should include customer features and a churn column",
+        key="raw_upload"  # stable key helps Streamlit keep widget identity
     )
-    
+
+    # If user uploads a file now: store bytes + name and parse
     if uploaded_file is not None:
         try:
-            df = pd.read_csv(uploaded_file)
-            st.session_state.df_raw = df
-            st.success(f"✅ Dataset loaded: {len(df)} rows, {len(df.columns)} columns")
+            st.session_state.raw_bytes = uploaded_file.getvalue()
+            st.session_state.raw_name  = uploaded_file.name
+            st.session_state.df_raw    = pd.read_csv(io.BytesIO(st.session_state.raw_bytes))
+            st.success(f"✅ Dataset loaded: {len(st.session_state.df_raw)} rows, {len(st.session_state.df_raw.columns)} columns")
         except Exception as e:
             st.error(f"Error loading file: {str(e)}")
-            df = None
-    
-    # Display data if it exists in session state (even if no file is currently uploaded)
+
+    # If we already have bytes from earlier in this session, reconstruct df if needed
+    if st.session_state.raw_bytes is not None and st.session_state.df_raw is None:
+        st.session_state.df_raw = pd.read_csv(io.BytesIO(st.session_state.raw_bytes))
+
+    # Display if present
     if st.session_state.df_raw is not None:
         df = st.session_state.df_raw
-        
-        # Show data info
+
         col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Rows", f"{len(df):,}")
-        with col2:
-            st.metric("Total Columns", len(df.columns))
-        with col3:
-            st.metric("Missing Values", int(df.isnull().sum().sum()))
-        
+        with col1: st.metric("Total Rows", f"{len(df):,}")
+        with col2: st.metric("Total Columns", len(df.columns))
+        with col3: st.metric("Missing Values", int(df.isnull().sum().sum()))
+
         st.subheader("📋 Data Preview")
         st.dataframe(df.head(10), use_container_width=True)
-        
+
         st.subheader("📊 Column Information")
         info_df = pd.DataFrame({
             "Column": df.columns,
@@ -275,15 +281,10 @@ if page == "📤 Upload Data":
             "Null Count": df.isnull().sum().values
         })
         st.dataframe(info_df, use_container_width=True)
-        
-        # Add option to clear and start over
+
         if st.button("🗑️ Clear Data and Start Over"):
-            st.session_state.df_raw = None
-            st.session_state.df_clean = None
-            st.session_state.models = {}
-            st.session_state.results = None
-            st.session_state.production_model = None
-            st.session_state.feature_schema = None
+            for k in ["df_raw","df_clean","models","results","production_model","feature_schema","raw_bytes","raw_name"]:
+                st.session_state[k] = None if k not in ("models",) else {}
             st.rerun()
             
 # ==================== PAGE 2: DATA CLEANING ====================
