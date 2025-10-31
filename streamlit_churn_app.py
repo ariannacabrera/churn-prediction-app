@@ -24,6 +24,13 @@ from sklearn.metrics import (
     confusion_matrix
 )
 
+# helper to avoid page resets
+@st.cache_data(show_spinner=False)
+def _read_csv_from_bytes(raw_bytes: bytes) -> pd.DataFrame:
+    import io
+    return pd.read_csv(io.BytesIO(raw_bytes))
+
+
 # ==================== CONFIGURATION ====================
 st.set_page_config(
     page_title="Churn Prediction Platform",
@@ -58,6 +65,8 @@ st.markdown("""
 # ==================== SESSION STATE ====================
 if 'df_raw' not in st.session_state:
     st.session_state.df_raw = None
+    st.session_state.setdefault("raw_bytes", None)   # uploaded file bytes
+    st.session_state.setdefault("raw_name",  None) 
 if 'df_clean' not in st.session_state:
     st.session_state.df_clean = None
 if 'models' not in st.session_state:
@@ -244,32 +253,40 @@ if page == "📤 Upload Data":
         "Upload CSV file with customer data",
         type=['csv'],
         help="Your dataset should include customer features and a churn column",
-        key="raw_upload"  # stable key helps Streamlit keep widget identity
+        key="upload_csv"
     )
 
-    # If user uploads a file now: store bytes + name and parse
+    # If a file is uploaded now, handle it once
     if uploaded_file is not None:
+        # If it's a different file than the one already loaded, clear downstream state
+        prev_name = st.session_state.raw_name
+        if prev_name and uploaded_file.name != prev_name:
+            for k in ["df_clean", "models", "results", "production_model", "feature_schema"]:
+                st.session_state[k] = None if k != "models" else {}
+
+        st.session_state.raw_bytes = uploaded_file.getvalue()
+        st.session_state.raw_name  = uploaded_file.name
         try:
-            st.session_state.raw_bytes = uploaded_file.getvalue()
-            st.session_state.raw_name  = uploaded_file.name
-            st.session_state.df_raw    = pd.read_csv(io.BytesIO(st.session_state.raw_bytes))
+            st.session_state.df_raw = _read_csv_from_bytes(st.session_state.raw_bytes)
             st.success(f"✅ Dataset loaded: {len(st.session_state.df_raw)} rows, {len(st.session_state.df_raw.columns)} columns")
         except Exception as e:
-            st.error(f"Error loading file: {str(e)}")
+            st.error(f"Error loading file: {e}")
 
-    # If we already have bytes from earlier in this session, reconstruct df if needed
+    # If we had a prior upload, rebuild df_raw from bytes on page revisit
     if st.session_state.raw_bytes is not None and st.session_state.df_raw is None:
-        st.session_state.df_raw = pd.read_csv(io.BytesIO(st.session_state.raw_bytes))
+        try:
+            st.session_state.df_raw = _read_csv_from_bytes(st.session_state.raw_bytes)
+            st.info(f"Restored dataset: {st.session_state.raw_name}")
+        except Exception as e:
+            st.error(f"Could not restore previous upload: {e}")
 
-    # Display if present
+    # Show preview if available
     if st.session_state.df_raw is not None:
         df = st.session_state.df_raw
-
         col1, col2, col3 = st.columns(3)
         with col1: st.metric("Total Rows", f"{len(df):,}")
         with col2: st.metric("Total Columns", len(df.columns))
         with col3: st.metric("Missing Values", int(df.isnull().sum().sum()))
-
         st.subheader("📋 Data Preview")
         st.dataframe(df.head(10), use_container_width=True)
 
@@ -284,9 +301,11 @@ if page == "📤 Upload Data":
 
         if st.button("🗑️ Clear Data and Start Over"):
             for k in ["df_raw","df_clean","models","results","production_model","feature_schema","raw_bytes","raw_name"]:
-                st.session_state[k] = None if k not in ("models",) else {}
+                st.session_state[k] = None if k != "models" else {}
             st.rerun()
-            
+    else:
+        st.info("Upload a CSV to get started.")
+
 # ==================== PAGE 2: DATA CLEANING ====================
 elif page == "🧹 Data Cleaning":
     st.header("🧹 Data Cleaning & Preparation")
@@ -295,41 +314,45 @@ elif page == "🧹 Data Cleaning":
         st.warning("⚠️ Please upload a dataset first!")
     else:
         df = st.session_state.df_raw.copy()
-        
+
+        # Initialize selected_columns ONCE from current df
+        if 'selected_columns' not in st.session_state or st.session_state.selected_columns is None:
+            st.session_state.selected_columns = df.columns.tolist()
+
+        # Initialize/remember target column ONCE
+        if 'target_col' not in st.session_state or st.session_state.target_col is None:
+            lower_cols = [c.lower() for c in df.columns]
+            st.session_state.target_col = df.columns[lower_cols.index('churn')] if 'churn' in lower_cols else df.columns[0]
+
         st.subheader("⚙️ Cleaning Options")
-        
+
+        # Bind the Target selectbox to session state
         target_col = st.selectbox(
-            "Select Target Column (Churn)",
+            "Select Target Column (Churn/Outcome)",
             options=df.columns.tolist(),
-            index=len(df.columns)-1 if 'churn' in df.columns else 0
+            index=df.columns.get_loc(st.session_state.target_col),
+            help="Select the column you want to predict"
         )
-        
+        st.session_state.target_col = target_col
+
         if st.button("🔄 Clean Data", type="primary"):
             try:
                 with st.spinner("Cleaning data..."):
-                    # Show original target distribution
                     st.info(f"📊 Original '{target_col}' values: {df[target_col].value_counts().to_dict()}")
-                    
                     df_clean = clean_data(df, target_col)
                     st.session_state.df_clean = df_clean
                     st.session_state.target_col = target_col
-                    
-                    # Show cleaned target distribution
                     st.info(f"📊 Cleaned '{target_col}' values: {df_clean[target_col].value_counts().to_dict()}")
-                
                 st.success("✅ Data cleaned successfully!")
             except ValueError as e:
                 st.error(f"❌ Error: {str(e)}")
-                st.info("💡 Make sure your target column has both churned (1) and non-churned (0) customers.")
-                
-                # Debug info
                 with st.expander("🔍 Debug Information"):
                     st.write(f"Target column: {target_col}")
                     st.write(f"Unique values in target: {df[target_col].unique()}")
                     st.write(f"Value counts: {df[target_col].value_counts()}")
                     st.write(f"Data type: {df[target_col].dtype}")
                 st.stop()
-            
+
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Rows Before", len(df))
@@ -337,15 +360,13 @@ elif page == "🧹 Data Cleaning":
             with col2:
                 st.metric("Rows Removed", len(df) - len(df_clean))
                 st.metric("Columns", len(df_clean.columns))
-            
+
             st.subheader("📊 Cleaned Data Preview")
             st.dataframe(df_clean.head(10), use_container_width=True)
-            
-            # Churn distribution
+
             if target_col in df_clean.columns:
                 st.subheader("🎯 Target Distribution")
                 churn_counts = df_clean[target_col].dropna().value_counts().sort_index()
-                
                 if len(churn_counts) > 0:
                     labels = ['No Churn' if i == 0 else 'Churn' for i in churn_counts.index]
                     fig = px.pie(
@@ -355,15 +376,12 @@ elif page == "🧹 Data Cleaning":
                         color_discrete_sequence=['#667eea', '#764ba2']
                     )
                     st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Show counts
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("No Churn", int(churn_counts.get(0, 0)))
-                    with col2:
-                        st.metric("Churn", int(churn_counts.get(1, 0)))
+                    c1, c2 = st.columns(2)
+                    with c1: st.metric("No Churn", int(churn_counts.get(0, 0)))
+                    with c2: st.metric("Churn", int(churn_counts.get(1, 0)))
                 else:
                     st.warning("⚠️ No valid churn data found in target column")
+
 
 # ==================== PAGE 3: TRAIN MODELS ====================
 elif page == "🤖 Train Models":
