@@ -27,7 +27,6 @@ from sklearn.metrics import (
 # helper to avoid page resets
 @st.cache_data(show_spinner=False)
 def _read_csv_from_bytes(raw_bytes: bytes) -> pd.DataFrame:
-    import io
     return pd.read_csv(io.BytesIO(raw_bytes))
 
 
@@ -62,25 +61,25 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== SESSION STATE ====================
-if 'df_raw' not in st.session_state:
-    st.session_state.df_raw = None
-    st.session_state.setdefault("raw_bytes", None)   # uploaded file bytes
-    st.session_state.setdefault("raw_name",  None) 
-if 'df_clean' not in st.session_state:
-    st.session_state.df_clean = None
-if 'models' not in st.session_state:
-    st.session_state.models = {}
-if 'results' not in st.session_state:
-    st.session_state.results = None
-if 'production_model' not in st.session_state:
-    st.session_state.production_model = None
-if 'feature_schema' not in st.session_state:
-    st.session_state.feature_schema = None
-if 'raw_bytes' not in st.session_state:
-    st.session_state.raw_bytes = None
-if 'raw_name' not in st.session_state:
-    st.session_state.raw_name = None
+# ==================== SESSION STATE INITIALIZATION ====================
+# Initialize all session state variables with defaults
+default_states = {
+    'df_raw': None,
+    'raw_bytes': None,
+    'raw_name': None,
+    'df_clean': None,
+    'models': {},
+    'results': None,
+    'production_model': None,
+    'feature_schema': None,
+    'target_col': None,
+    'selected_columns': None,
+    'X_test': None
+}
+
+for key, default_value in default_states.items():
+    if key not in st.session_state:
+        st.session_state[key] = default_value
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -249,6 +248,10 @@ page = st.sidebar.selectbox(
 if page == "📤 Upload Data":
     st.header("📤 Upload Your Dataset")
 
+    # Show current file status if one exists
+    if st.session_state.raw_name:
+        st.info(f"📁 Current file: **{st.session_state.raw_name}**")
+
     uploaded_file = st.file_uploader(
         "Upload CSV file with customer data",
         type=['csv'],
@@ -256,37 +259,48 @@ if page == "📤 Upload Data":
         key="upload_csv"
     )
 
-    # If a file is uploaded now, handle it once
+    # Handle new file upload
     if uploaded_file is not None:
-        # If it's a different file than the one already loaded, clear downstream state
-        prev_name = st.session_state.raw_name
-        if prev_name and uploaded_file.name != prev_name:
-            for k in ["df_clean", "models", "results", "production_model", "feature_schema"]:
-                st.session_state[k] = None if k != "models" else {}
+        new_bytes = uploaded_file.getvalue()
+        
+        # Check if this is a new file (different from current)
+        if st.session_state.raw_bytes is None or new_bytes != st.session_state.raw_bytes:
+            # Clear all downstream state for new file
+            st.session_state.raw_bytes = new_bytes
+            st.session_state.raw_name = uploaded_file.name
+            st.session_state.df_clean = None
+            st.session_state.models = {}
+            st.session_state.results = None
+            st.session_state.production_model = None
+            st.session_state.feature_schema = None
+            st.session_state.target_col = None
+            st.session_state.selected_columns = None
+            st.session_state.X_test = None
+            
+            try:
+                st.session_state.df_raw = _read_csv_from_bytes(st.session_state.raw_bytes)
+                st.success(f"✅ New dataset loaded: {len(st.session_state.df_raw)} rows, {len(st.session_state.df_raw.columns)} columns")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error loading file: {e}")
+                st.session_state.raw_bytes = None
+                st.session_state.raw_name = None
 
-        st.session_state.raw_bytes = uploaded_file.getvalue()
-        st.session_state.raw_name  = uploaded_file.name
-        try:
-            st.session_state.df_raw = _read_csv_from_bytes(st.session_state.raw_bytes)
-            st.success(f"✅ Dataset loaded: {len(st.session_state.df_raw)} rows, {len(st.session_state.df_raw.columns)} columns")
-        except Exception as e:
-            st.error(f"Error loading file: {e}")
-
-    # If we had a prior upload, rebuild df_raw from bytes on page revisit
+    # Restore df_raw from bytes if needed (after navigation)
     if st.session_state.raw_bytes is not None and st.session_state.df_raw is None:
         try:
             st.session_state.df_raw = _read_csv_from_bytes(st.session_state.raw_bytes)
-            st.info(f"Restored dataset: {st.session_state.raw_name}")
         except Exception as e:
             st.error(f"Could not restore previous upload: {e}")
 
-    # Show preview if available
+    # Show preview if data is available
     if st.session_state.df_raw is not None:
         df = st.session_state.df_raw
         col1, col2, col3 = st.columns(3)
         with col1: st.metric("Total Rows", f"{len(df):,}")
         with col2: st.metric("Total Columns", len(df.columns))
         with col3: st.metric("Missing Values", int(df.isnull().sum().sum()))
+        
         st.subheader("📋 Data Preview")
         st.dataframe(df.head(10), use_container_width=True)
 
@@ -300,11 +314,11 @@ if page == "📤 Upload Data":
         st.dataframe(info_df, use_container_width=True)
 
         if st.button("🗑️ Clear Data and Start Over"):
-            for k in ["df_raw","df_clean","models","results","production_model","feature_schema","raw_bytes","raw_name"]:
-                st.session_state[k] = None if k != "models" else {}
+            for key in default_states.keys():
+                st.session_state[key] = default_states[key]
             st.rerun()
     else:
-        st.info("Upload a CSV to get started.")
+        st.info("👆 Upload a CSV file to get started.")
 
 # ==================== PAGE 2: DATA CLEANING ====================
 elif page == "🧹 Data Cleaning":
@@ -312,25 +326,27 @@ elif page == "🧹 Data Cleaning":
     
     if st.session_state.df_raw is None:
         st.warning("⚠️ Please upload a dataset first!")
+        if st.button("Go to Upload Page"):
+            st.switch_page
     else:
+        # Restore df_raw if needed
+        if st.session_state.df_raw is None and st.session_state.raw_bytes is not None:
+            st.session_state.df_raw = _read_csv_from_bytes(st.session_state.raw_bytes)
+        
         df = st.session_state.df_raw.copy()
 
-        # Initialize selected_columns ONCE from current df
-        if 'selected_columns' not in st.session_state or st.session_state.selected_columns is None:
-            st.session_state.selected_columns = df.columns.tolist()
-
-        # Initialize/remember target column ONCE
-        if 'target_col' not in st.session_state or st.session_state.target_col is None:
+        # Initialize target column selection
+        if st.session_state.target_col is None:
             lower_cols = [c.lower() for c in df.columns]
             st.session_state.target_col = df.columns[lower_cols.index('churn')] if 'churn' in lower_cols else df.columns[0]
 
         st.subheader("⚙️ Cleaning Options")
 
-        # Bind the Target selectbox to session state
+        # Target column selection
         target_col = st.selectbox(
             "Select Target Column (Churn/Outcome)",
             options=df.columns.tolist(),
-            index=df.columns.get_loc(st.session_state.target_col),
+            index=df.columns.get_loc(st.session_state.target_col) if st.session_state.target_col in df.columns else 0,
             help="Select the column you want to predict"
         )
         st.session_state.target_col = target_col
@@ -353,6 +369,10 @@ elif page == "🧹 Data Cleaning":
                     st.write(f"Data type: {df[target_col].dtype}")
                 st.stop()
 
+        # Show cleaned data summary if available
+        if st.session_state.df_clean is not None:
+            df_clean = st.session_state.df_clean
+            
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Rows Before", len(df))
@@ -416,6 +436,11 @@ elif page == "🤖 Train Models":
                     st.dataframe(results.style.highlight_max(axis=0, color='lightgreen'), use_container_width=True)
                 except Exception as e:
                     st.error(f"Error training models: {str(e)}")
+        
+        # Show existing results if available
+        if st.session_state.results is not None:
+            st.subheader("📊 Previous Training Results")
+            st.dataframe(st.session_state.results.style.highlight_max(axis=0, color='lightgreen'), use_container_width=True)
 
 # ==================== PAGE 4: MODEL COMPARISON ====================
 elif page == "📊 Model Comparison":
@@ -475,11 +500,17 @@ elif page == "📊 Model Comparison":
         
         # Deploy to production
         st.subheader("🚀 Deploy Model")
+        
+        # Show current production model if one exists
+        if st.session_state.production_model is not None:
+            st.info("✅ A model is currently deployed to production")
+        
         selected_model = st.selectbox("Select model for production", results.index.tolist())
         
         if st.button("Deploy to Production", type="primary"):
             st.session_state.production_model = models[selected_model]['pipeline']
             st.success(f"✅ {selected_model} deployed to production!")
+            st.balloons()
 
 # ==================== PAGE 5: MAKE PREDICTIONS ====================
 elif page == "🔮 Make Predictions":
